@@ -6,8 +6,10 @@ import type { GeneratedMedia, MediaGenerationRequest, MediaModel, MediaReference
 import conf from "@/utils/conf";
 import { getMediaProvider, listMediaProviders, loadMediaProviderSource } from "@/utils/media/provider";
 import { lockWorkspaceFiles, resolveWorkspacePath, writeWorkspaceFile } from "@/utils/workspace/files";
+import { downloadPublicFile } from "@/utils/workspace/download";
 import { beginGeneration, getProviderPrice } from "@/utils/media/billing";
 import { detectMimeType, readPriceReference } from "@/utils/media/priceReference";
+import { z } from "zod";
 
 const maxMediaSize = 100 * 1024 * 1024;
 const mediaExtensions: Record<string, string> = {
@@ -17,6 +19,39 @@ const mediaExtensions: Record<string, string> = {
   "audio/mpeg": "mp3", "audio/wav": "wav", "audio/ogg": "ogg", "audio/webm": "webm",
   "audio/flac": "flac", "audio/aac": "aac", "audio/mp4": "m4a", "audio/opus": "opus", "audio/pcm": "pcm",
 };
+
+const mediaGenerationMetadataSchema = z.strictObject({
+  promptRequired: z.boolean().optional(),
+  promptMaxLength: z.number().int().min(1).max(100000).optional(),
+  inputs: z.array(z.strictObject({
+    id: z.string().regex(/^[a-z][a-zA-Z0-9]{0,63}$/),
+    label: z.string().trim().min(1).max(200),
+    mediaType: z.enum(["image", "video", "audio"]),
+    fallback: z.enum(["images", "videos", "audios", "firstFrame", "lastFrame"]).optional(),
+    fallbackIndex: z.number().int().min(0).max(63).optional(),
+    required: z.boolean().optional(),
+    minItems: z.number().int().min(0).max(64).optional(),
+    maxItems: z.number().int().min(1).max(64).optional(),
+    accept: z.array(z.string().max(100).regex(/^(image|video|audio)\/(?:\*|[a-z0-9.+-]+)$/i)).max(32).optional(),
+  })).max(64).optional(),
+  parameters: z.array(z.strictObject({
+    id: z.string().regex(/^[a-z][a-zA-Z0-9]{0,63}$/),
+    label: z.string().trim().min(1).max(200),
+    type: z.enum(["string", "number", "boolean"]),
+    required: z.boolean().optional(),
+    allowCustom: z.boolean().optional(),
+    options: z.array(z.union([z.string().max(4096), z.number().finite()])).max(100).optional(),
+    min: z.number().finite().optional(),
+    max: z.number().finite().optional(),
+    step: z.number().positive().finite().optional(),
+    defaultValue: z.union([z.string().max(4096), z.number().finite(), z.boolean()]).optional(),
+  })).max(64).optional(),
+});
+
+function mediaGenerationMetadata(value: unknown): MediaModel["generation"] | undefined {
+  const result = mediaGenerationMetadataSchema.safeParse(value);
+  return result.success ? result.data : undefined;
+}
 
 function invalid(message: string): never {
   throw Object.assign(new Error(message), { status: 400 });
@@ -30,6 +65,14 @@ function imageOptions(value: unknown, pattern: RegExp) {
   return Array.isArray(value) ? [...new Set(value.filter((item): item is string => typeof item === "string" && item.length <= 64 && item === item.trim() && pattern.test(item)))] : undefined;
 }
 
+function matchesMimeType(mimeType: string, accepted: string[]) {
+  const normalized = mimeType.split(";")[0]!.trim().toLowerCase();
+  return accepted.some(item => {
+    const type = item.toLowerCase();
+    return type.endsWith("/*") ? normalized.startsWith(type.slice(0, -1)) : normalized === type;
+  });
+}
+
 export async function listMediaModels(): Promise<MediaModel[]> {
   const installedProviders = await listMediaProviders();
   return installedProviders.flatMap(provider => provider.models.flatMap(model => {
@@ -39,6 +82,7 @@ export async function listMediaModels(): Promise<MediaModel[]> {
       providerId: provider.id, providerLabel: provider.label, modelId: model.id, label: model.label, type: model.type,
       supportsPrice: "supportsPrice" in provider && provider.supportsPrice === true,
       mode: model.mode, durationResolutionMap: model.durationResolutionMap, audio: model.audio,
+      generation: mediaGenerationMetadata(model.generation),
       ...(model.type === "audio" ? { voices: model.voices } : {}),
       ...(model.type === "image" ? {
         imageSizes: imageOptions(Array.isArray(model.imageSizes) ? model.imageSizes : builtIn?.imageSizes, /^[^\u0000-\u001f\u007f]+$/),
@@ -61,28 +105,15 @@ export async function readReference(cwd: string, reference: MediaReference, medi
 }
 
 async function downloadAsset(url: string, signal?: AbortSignal) {
-  if (!/^https?:\/\//i.test(url)) invalid("生成结果必须使用 HTTP 或 HTTPS 地址");
-  const response = await fetch(url, { signal });
-  if (!response.ok) throw new Error(t`下载生成结果失败（HTTP ${response.status}）`);
-  if (Number(response.headers.get("content-length")) > maxMediaSize) {
-    await response.body?.cancel();
-    invalid("生成文件不能超过 100 MB");
-  }
-  const reader = response.body?.getReader();
-  if (!reader) invalid("生成结果为空");
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  try {
-    while (true) {
-      signal?.throwIfAborted();
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > maxMediaSize) invalid("生成文件不能超过 100 MB");
-      chunks.push(value);
-    }
-  } finally { await reader.cancel(); }
-  return { bytes: Buffer.concat(chunks, size), mimeType: response.headers.get("content-type") ?? "" };
+  let mimeType = "";
+  const bytes = await downloadPublicFile(url, {
+    signal: signal ?? new AbortController().signal,
+    maxBytes: maxMediaSize,
+    label: "生成文件",
+    accept: "image/*,video/*,audio/*",
+    onContentType: value => { mimeType = value ?? ""; },
+  });
+  return { bytes, mimeType };
 }
 
 async function assetBytes(asset: MediaAsset, mediaType: "image" | "video" | "audio", signal?: AbortSignal) {
@@ -110,7 +141,7 @@ async function assetBytes(asset: MediaAsset, mediaType: "image" | "video" | "aud
 }
 
 async function prepareRequest<T>(directory: string | undefined, mediaType: "image" | "video" | "audio", request: MediaGenerationRequest,
-  read: (cwd: string, reference: MediaReference, type: string, signal?: AbortSignal) => Promise<T>, signal?: AbortSignal) {
+  read: (cwd: string, reference: MediaReference, type: string, signal?: AbortSignal) => Promise<T>, generation?: MediaModel["generation"], signal?: AbortSignal) {
   const references = async (items: MediaReference[] | undefined, type: string) => {
     if (!items?.length) return items ? [] : undefined;
     if (!directory) invalid("参考媒体需要工作目录");
@@ -120,31 +151,94 @@ async function prepareRequest<T>(directory: string | undefined, mediaType: "imag
     return result;
   };
   const images = await references(request.images, "image");
-  if (mediaType === "audio") return {
-    type: "audio" as const, model: request.modelId, text: request.prompt, images, audios: await references(request.audios, "audio"),
-    voice: request.voice, speed: request.speed, volume: request.volume, pitch: request.pitch, language: request.language, format: request.format, sampleRate: request.sampleRate,
+  const videos = await references(request.videos, "video");
+  const audios = await references(request.audios, "audio");
+  const firstFrame = (await references(request.firstFrame ? [request.firstFrame] : undefined, "image"))?.[0];
+  const lastFrame = (await references(request.lastFrame ? [request.lastFrame] : undefined, "image"))?.[0];
+  const fallbackInputs: Record<string, T[] | undefined> = {
+    images, videos, audios,
+    firstFrame: firstFrame === undefined ? undefined : [firstFrame],
+    lastFrame: lastFrame === undefined ? undefined : [lastFrame],
   };
-  if (mediaType === "image") return { type: "image" as const, model: request.modelId, prompt: request.prompt, images, ratio: request.ratio, size: request.size };
+  const definitions = generation?.inputs ?? [];
+  const namedInputs = record(request.inputs);
+  if (Object.keys(namedInputs).some(key => !definitions.some(item => item.id === key))) invalid("请求包含当前模型未声明的素材输入角色");
+  const inputs: Record<string, T[]> = {};
+  for (const definition of definitions) {
+    const value = namedInputs[definition.id];
+    if (value !== undefined && !Array.isArray(value)) invalid(`素材输入“${definition.label}”必须是数组`);
+    const items = (value ?? []) as MediaReference[];
+    const fallback = fallbackInputs[definition.fallback ?? ""] ?? [];
+    const fallbackReferences = definition.fallbackIndex === undefined
+      ? fallback
+      : fallback[definition.fallbackIndex] === undefined ? [] : [fallback[definition.fallbackIndex]!];
+    const loaded = value === undefined
+      ? fallbackReferences
+      : await references(items, definition.mediaType) ?? [];
+    const itemCount = value === undefined ? loaded.length : items.length;
+    const minimum = definition.minItems ?? (definition.required ? 1 : 0);
+    if (itemCount < minimum) invalid(`素材输入“${definition.label}”至少需要 ${minimum} 个文件`);
+    if (definition.maxItems !== undefined && itemCount > definition.maxItems) invalid(`素材输入“${definition.label}”最多接受 ${definition.maxItems} 个文件`);
+    if (definition.accept?.length && loaded.some(item => {
+      const mimeType = record(item).mimeType;
+      return typeof mimeType !== "string" || !matchesMimeType(mimeType, definition.accept!);
+    })) invalid(`素材输入“${definition.label}”的文件格式不受支持`);
+    if (loaded.length) inputs[definition.id] = loaded;
+  }
+  const prompt = request.prompt ?? "";
+  const other = record(request.other);
+  if (generation?.parameters) {
+    const parameters = new Map(generation.parameters.map(item => [item.id, item]));
+    if (Object.keys(other).some(key => !parameters.has(key))) invalid("请求包含当前模型未声明的专属参数");
+    for (const definition of generation.parameters) {
+      const requestParameters = request as unknown as Record<string, unknown>;
+      const value = Object.hasOwn(other, definition.id) ? other[definition.id] : requestParameters[definition.id] ?? definition.defaultValue;
+      if (value === undefined || value === null || value === "") {
+        if (definition.required) invalid(`模型参数“${definition.label}”为必填项`);
+        continue;
+      }
+      if (definition.type === "string" && typeof value !== "string" || definition.type === "number" && (typeof value !== "number" || !Number.isFinite(value)) || definition.type === "boolean" && typeof value !== "boolean") invalid(`模型参数“${definition.label}”的值类型不正确`);
+      if (typeof value === "string" && definition.required && !value.trim()) invalid(`模型参数“${definition.label}”不能为空`);
+      if (typeof value === "number") {
+        const stepOffset = value - (definition.min ?? 0);
+        if (definition.min !== undefined && value < definition.min || definition.max !== undefined && value > definition.max
+          || definition.step && Math.abs(stepOffset / definition.step - Math.round(stepOffset / definition.step)) > 1e-8) invalid(`模型参数“${definition.label}”超出允许范围`);
+      }
+      if (definition.options?.length && !definition.allowCustom && !definition.options.includes(value as string | number)) invalid(`模型参数“${definition.label}”不在允许选项中`);
+    }
+  }
+  if (mediaType === "audio") return {
+    type: "audio" as const, model: request.modelId, prompt, text: prompt, images, audios,
+    voice: request.voice, speed: request.speed, volume: request.volume, pitch: request.pitch, language: request.language, format: request.format, sampleRate: request.sampleRate,
+    inputs, other,
+  };
+  if (mediaType === "image") return { type: "image" as const, model: request.modelId, prompt, images, ratio: request.ratio, size: request.size, inputs, other };
   return {
-    type: "video" as const, model: request.modelId, prompt: request.prompt, images,
-    videos: await references(request.videos, "video"), audios: await references(request.audios, "audio"),
-    firstFrame: (await references(request.firstFrame ? [request.firstFrame] : undefined, "image"))?.[0],
-    lastFrame: (await references(request.lastFrame ? [request.lastFrame] : undefined, "image"))?.[0],
-    ratio: request.ratio, resolution: request.resolution, duration: request.duration, generateAudio: request.generateAudio, mode: request.mode,
+    type: "video" as const, model: request.modelId, prompt, images,
+    videos, audios, firstFrame, lastFrame,
+    ratio: request.ratio, resolution: request.resolution, duration: request.duration, generateAudio: request.generateAudio, mode: request.mode, inputs, other,
   };
 }
 
 async function configuredProvider(request: MediaGenerationRequest, mediaType: "image" | "video" | "audio", signal?: AbortSignal, directory?: string) {
   const info = await getMediaProvider(request.providerId);
-  if (!info.models.some(model => model.id === request.modelId && model.type === mediaType)) invalid("所选媒体模型不存在或类型不匹配，请重新选择");
+  const selectedModel = info.models.find(item => item.id === request.modelId && item.type === mediaType);
+  if (!selectedModel) invalid("所选媒体模型不存在或类型不匹配，请重新选择");
+  const model = { ...selectedModel, generation: mediaGenerationMetadata(selectedModel.generation) };
   const configurations = record(conf.get("settings", {}).mediaProviderConfigs);
-  return loadMediaProviderSource(info.source, record(configurations[info.id]), signal, undefined, directory);
+  return { model, provider: await loadMediaProviderSource(info.source, record(configurations[info.id]), signal, undefined, directory) };
 }
 
-async function preparePriceRequest(directory: string | undefined, mediaType: "image" | "video" | "audio", request: MediaGenerationRequest, signal?: AbortSignal) {
+async function preparePriceRequest(directory: string | undefined, mediaType: "image" | "video" | "audio", request: MediaGenerationRequest, generation: MediaModel["generation"], signal?: AbortSignal) {
   const deadline = AbortSignal.timeout(5000);
   const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
-  try { return await prepareRequest(directory, mediaType, request, readPriceReference, combined); }
+  try {
+    const prepared = await prepareRequest(directory, mediaType, request, readPriceReference, generation, combined);
+    const { inputs, other, ...priceRequest } = prepared;
+    void inputs;
+    void other;
+    return priceRequest;
+  }
   catch (error) {
     signal?.throwIfAborted();
     if (deadline.aborted) throw new Error("读取参考媒体信息超时，请稍后重试");
@@ -154,9 +248,9 @@ async function preparePriceRequest(directory: string | undefined, mediaType: "im
 
 export async function getMediaPrice(directory: string | undefined, mediaType: "image" | "video" | "audio", request: MediaGenerationRequest, signal?: AbortSignal) {
   signal?.throwIfAborted();
-  const provider = await configuredProvider(request, mediaType, signal, directory);
+  const { provider, model } = await configuredProvider(request, mediaType, signal, directory);
   if (!provider.getPrice) return null;
-  const prepared = await preparePriceRequest(directory, mediaType, request, signal);
+  const prepared = await preparePriceRequest(directory, mediaType, request, model.generation, signal);
   signal?.throwIfAborted();
   return getProviderPrice(provider, prepared);
 }
@@ -168,16 +262,18 @@ export async function generateMedia(
   signal?: AbortSignal,
 ): Promise<GeneratedMedia[]> {
   signal?.throwIfAborted();
-  if (!request.prompt.trim()) invalid("请输入生成提示词");
   const directory = await realpath(cwd);
   const outputDirectory = request.outputDirectory ?? "assets/generated";
   await resolveWorkspacePath(directory, outputDirectory, true);
-  const provider = await configuredProvider(request, mediaType, signal, directory);
+  const { provider, model } = await configuredProvider(request, mediaType, signal, directory);
+  const prompt = request.prompt?.trim() ?? "";
+  if (model.generation?.promptRequired !== false && !prompt) invalid("请输入生成提示词");
+  if (model.generation?.promptMaxLength && prompt.length > model.generation.promptMaxLength) invalid(`提示词不能超过 ${model.generation.promptMaxLength} 个字符`);
   const generate = mediaType === "image" ? provider.generateImage : mediaType === "video" ? provider.generateVideo : provider.generateAudio;
   if (typeof generate !== "function") invalid(t`此供应商不支持${translateMessage({ image: "图片", video: "视频", audio: "音频" }[mediaType])}生成`);
   const rules = Array.isArray(provider.rules) ? provider.rules : [];
   if (rules.some(rule => rule.field === "apiKey") && (typeof provider.config.apiKey !== "string" || !provider.config.apiKey.trim())) invalid("请先在媒体模型设置中配置供应商 API Key");
-  const prepared = await prepareRequest(directory, mediaType, request, readReference, signal);
+  const prepared = await prepareRequest(directory, mediaType, { ...request, prompt }, readReference, model.generation, signal);
   signal?.throwIfAborted();
   const finish = beginGeneration(provider);
   const written: string[] = [];
