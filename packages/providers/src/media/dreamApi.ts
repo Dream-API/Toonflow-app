@@ -697,7 +697,7 @@ async function generate(context: ProviderContext, mediaType: DreamOperation["typ
 export default {
   id: "dreamApi",
   label: "DreamAPI",
-  icon: "",
+  icon: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='64' height='64' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop stop-color='%232563eb'/%3E%3Cstop offset='1' stop-color='%237c3aed'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='16' fill='url(%23g)'/%3E%3Cpath d='M16 17h14c11 0 18 7 18 15s-7 15-18 15H16zm12 22c6 0 9-3 9-7s-3-7-9-7h-4v14z' fill='%23fff'/%3E%3Ccircle cx='47' cy='17' r='5' fill='%23a7f3d0'/%3E%3C/svg%3E",
   version: "1.0.0",
   rules,
   models: [
