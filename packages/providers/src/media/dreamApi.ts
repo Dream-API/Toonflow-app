@@ -99,7 +99,7 @@ const operations: DreamOperation[] = [
       input("onePieceGarment", "连衣裙/连体装图片", "image", "overallClothes", { maxItems: 1 }),
     ],
     parameters: [
-      parameter("enableShoes", "生成鞋子", "boolean", { defaultValue: true }),
+      parameter("enableShoes", "生成鞋子", "boolean", { defaultValue: false, omitFalse: true }),
       parameter("width", "输出宽度", "number", { min: 1, step: 1 }),
       parameter("height", "输出高度", "number", { min: 1, step: 1 }),
     ], special: "tryOn" },
@@ -171,7 +171,7 @@ const operations: DreamOperation[] = [
     ] },
   {
     id: "seedance25", label: "Seedance 2.5", type: "video", endpoint: "/api/async/seedance_2.5", apiModel: "seedance-2.5",
-    mode: ["text", "singleImage", "multiReference"], promptRequired: true, promptMaxLength: 1500, special: "seedance",
+    mode: ["text", "singleImage", "startEndRequired", "endFrameOptional", ["imageReference:9", "videoReference:10", "audioReference:3"]], promptRequired: true, promptMaxLength: 1500, special: "seedance",
     inputs: [
       input("images", "参考图片", "image", "images", { array: true, maxItems: 9, fallback: "images" }),
       input("firstFrame", "首帧图片", "image", "imageUrl", { maxItems: 1, fallback: "firstFrame" }),
@@ -193,7 +193,7 @@ const operations: DreamOperation[] = [
     { id: "seedance20Mini", label: "Seedance 2.0 Mini", apiModel: "seedance-2.0-mini", resolution: ["480p", "720p"], durationMax: 15, videoMax: 3 },
   ].map(({ id, label, apiModel, resolution, durationMax, videoMax }): DreamOperation => ({
     id, label, type: "video", endpoint: "/api/async/seedance_2.0", apiModel,
-    mode: ["text", "singleImage", "multiReference"], promptRequired: true, promptMaxLength: 1500, special: "seedance",
+    mode: ["text", "singleImage", "startEndRequired", "endFrameOptional", ["imageReference:9", `videoReference:${videoMax}`, "audioReference:3"]], promptRequired: true, promptMaxLength: 1500, special: "seedance",
     inputs: [
       input("images", "参考图片", "image", "images", { array: true, maxItems: 9, fallback: "images" }),
       input("firstFrame", "首帧图片", "image", "imageUrl", { maxItems: 1, fallback: "firstFrame" }),
@@ -1075,7 +1075,7 @@ export default {
             "id": "enableShoes",
             "label": "生成鞋子",
             "type": "boolean",
-            "defaultValue": true
+            "defaultValue": false
           },
           {
             "id": "width",
@@ -1872,6 +1872,7 @@ export default {
       "id": "seedance25",
       "label": "Seedance 2.5",
       "type": "video",
+      "mode": ["text", "singleImage", "startEndRequired", "endFrameOptional", ["imageReference:9", "videoReference:10", "audioReference:3"]],
       "generation": {
         "promptRequired": true,
         "promptMaxLength": 1500,
@@ -2000,6 +2001,7 @@ export default {
       "id": "seedance20",
       "label": "Seedance 2.0",
       "type": "video",
+      "mode": ["text", "singleImage", "startEndRequired", "endFrameOptional", ["imageReference:9", "videoReference:3", "audioReference:3"]],
       "generation": {
         "promptRequired": true,
         "promptMaxLength": 1500,
@@ -2123,6 +2125,7 @@ export default {
       "id": "seedance20Mini",
       "label": "Seedance 2.0 Mini",
       "type": "video",
+      "mode": ["text", "singleImage", "startEndRequired", "endFrameOptional", ["imageReference:9", "videoReference:3", "audioReference:3"]],
       "generation": {
         "promptRequired": true,
         "promptMaxLength": 1500,

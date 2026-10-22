@@ -66,7 +66,10 @@ export function validateDreamApiGeneration(model: NodeMediaModel, prompt: string
   }
 
   const parameters = request.other ?? {};
-  for (const definition of generation.parameters ?? []) {
+  const definitions = generation.parameters ?? [];
+  const allowedParameters = new Set(definitions.map(item => item.id));
+  if (Object.keys(parameters).some(key => !allowedParameters.has(key))) throw new Error("请求包含当前模型未声明的专属参数");
+  for (const definition of definitions) {
     const value = Object.hasOwn(parameters, definition.id) ? parameters[definition.id] : definition.defaultValue;
     if (value === undefined || value === null || value === "") {
       if (definition.required) throw new Error(`模型参数“${definition.label}”为必填项`);

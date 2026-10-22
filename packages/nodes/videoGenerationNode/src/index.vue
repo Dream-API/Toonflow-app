@@ -81,7 +81,7 @@
             </el-option-group>
           </el-select>
           <generationSettings
-            v-if="!selectedModel?.generation"
+            v-if="!selectedModel?.generation || selectedModel?.mode?.length"
             v-model:duration="data.duration"
             v-model:resolution="data.resolution"
             v-model:ratio="data.ratio"
@@ -89,6 +89,7 @@
             v-model:generateAudio="data.generateAudio"
             :ratios="ratioOptions"
             :model="selectedModel"
+            :mode-only="!!selectedModel?.generation"
             :disabled="generating || deleting || !selectedModel" />
           <div class="generationActions">
             <mediaPrice v-if="generationInput" :input="{ ...generationInput, mediaType: 'video' }" :supported="selectedModel?.supportsPrice === true" />

@@ -12,6 +12,8 @@ import { detectMimeType, readPriceReference } from "@/utils/media/priceReference
 import { z } from "zod";
 
 const maxMediaSize = 100 * 1024 * 1024;
+const maxRequestMediaSize = 100 * 1024 * 1024;
+const maxRequestMediaCount = 256;
 const mediaExtensions: Record<string, string> = {
   "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif",
   "image/avif": "avif", "image/bmp": "bmp", "image/tiff": "tiff",
@@ -92,16 +94,43 @@ export async function listMediaModels(): Promise<MediaModel[]> {
   }));
 }
 
-export async function readReference(cwd: string, reference: MediaReference, mediaType: string, signal?: AbortSignal): Promise<Extract<MediaInput, { type: "base64" }>> {
+type ReferenceReadBudget = {
+  usedBytes: number;
+  cache: Map<string, { revision: string; value: Promise<Extract<MediaInput, { type: "base64" }>> }>;
+};
+
+export async function readReference(cwd: string, reference: MediaReference, mediaType: string, signal?: AbortSignal, budget?: ReferenceReadBudget): Promise<Extract<MediaInput, { type: "base64" }>> {
   signal?.throwIfAborted();
   const { path } = await resolveWorkspacePath(cwd, reference.path);
   const info = await stat(path);
-  if (!info.isFile() || info.size > maxMediaSize) invalid("参考媒体须为不超过 100 MB 的文件");
-  const bytes = await readFile(path, { signal });
-  if (!bytes.length || bytes.length > maxMediaSize) invalid("参考媒体为空或超过 100 MB");
-  const mimeType = detectMimeType(bytes, reference.mimeType);
-  if (!mimeType.startsWith(`${mediaType}/`)) invalid(t`参考媒体类型须为 ${mediaType}`);
-  return { type: "base64", data: bytes.toString("base64"), mimeType, name: reference.path };
+  if (!info.isFile() || !info.size || info.size > maxMediaSize) invalid("参考媒体须为不超过 100 MB 的非空文件");
+  const key = JSON.stringify([path, mediaType, reference.mimeType]);
+  const revision = `${info.mtimeMs}:${info.ctimeMs}:${info.size}`;
+  const cached = budget?.cache.get(key);
+  if (cached) {
+    if (cached.revision !== revision) invalid("参考媒体已变化，请重试生成");
+    return cached.value;
+  }
+  if (budget) {
+    budget.usedBytes += info.size;
+    if (budget.usedBytes > maxRequestMediaSize) invalid("单次请求的参考素材总量不能超过 100 MB");
+  }
+  const value = (async () => {
+    const bytes = await readFile(path, { signal });
+    const latest = await stat(path);
+    if (`${latest.mtimeMs}:${latest.ctimeMs}:${latest.size}` !== revision) invalid("参考媒体已变化，请重试生成");
+    if (!bytes.length || bytes.length > maxMediaSize) invalid("参考媒体为空或超过 100 MB");
+    const mimeType = detectMimeType(bytes, reference.mimeType);
+    if (!mimeType.startsWith(`${mediaType}/`)) invalid(t`参考媒体类型须为 ${mediaType}`);
+    return { type: "base64" as const, data: bytes.toString("base64"), mimeType, name: reference.path };
+  })();
+  budget?.cache.set(key, { revision, value });
+  try {
+    return await value;
+  } catch (error) {
+    if (budget?.cache.get(key)?.value === value) budget.cache.delete(key);
+    throw error;
+  }
 }
 
 async function downloadAsset(url: string, signal?: AbortSignal) {
@@ -141,13 +170,65 @@ async function assetBytes(asset: MediaAsset, mediaType: "image" | "video" | "aud
 }
 
 async function prepareRequest<T>(directory: string | undefined, mediaType: "image" | "video" | "audio", request: MediaGenerationRequest,
-  read: (cwd: string, reference: MediaReference, type: string, signal?: AbortSignal) => Promise<T>, generation?: MediaModel["generation"], signal?: AbortSignal) {
+  read: (cwd: string, reference: MediaReference, type: string, signal?: AbortSignal, budget?: ReferenceReadBudget) => Promise<T>, generation?: MediaModel["generation"], signal?: AbortSignal) {
+  const definitions = generation?.inputs ?? [];
+  const namedInputs = record(request.inputs);
+  if (Object.keys(namedInputs).some(key => !definitions.some(item => item.id === key))) invalid("请求包含当前模型未声明的素材输入角色");
+  const fallbackReferences: Record<string, MediaReference[] | undefined> = {
+    images: request.images,
+    videos: request.videos,
+    audios: request.audios,
+    firstFrame: request.firstFrame ? [request.firstFrame] : undefined,
+    lastFrame: request.lastFrame ? [request.lastFrame] : undefined,
+  };
+  const plannedInputs = new Map<string, MediaReference[]>();
+  let referenceCount = (request.images?.length ?? 0) + (request.videos?.length ?? 0) + (request.audios?.length ?? 0)
+    + Number(!!request.firstFrame) + Number(!!request.lastFrame);
+  for (const definition of definitions) {
+    const value = namedInputs[definition.id];
+    if (value !== undefined && !Array.isArray(value)) invalid(`素材输入“${definition.label}”必须是数组`);
+    const fallback = fallbackReferences[definition.fallback ?? ""] ?? [];
+    const fromFallback = definition.fallbackIndex === undefined
+      ? fallback
+      : fallback[definition.fallbackIndex] === undefined ? [] : [fallback[definition.fallbackIndex]!];
+    const items = value === undefined ? fromFallback : value as MediaReference[];
+    const minimum = definition.minItems ?? (definition.required ? 1 : 0);
+    if (items.length < minimum) invalid(`素材输入“${definition.label}”至少需要 ${minimum} 个文件`);
+    if (definition.maxItems !== undefined && items.length > definition.maxItems) invalid(`素材输入“${definition.label}”最多接受 ${definition.maxItems} 个文件`);
+    plannedInputs.set(definition.id, items);
+    referenceCount += items.length;
+  }
+  if (referenceCount > maxRequestMediaCount) invalid(`单次请求最多接受 ${maxRequestMediaCount} 个参考素材`);
+
+  const other = record(request.other);
+  const strictParameters = request.providerId === "dreamApi" || generation !== undefined;
+  const parameters = generation?.parameters ?? [];
+  const parameterMap = new Map(parameters.map(item => [item.id, item]));
+  if (strictParameters && Object.keys(other).some(key => !parameterMap.has(key))) invalid("请求包含当前模型未声明的专属参数");
+  for (const definition of parameters) {
+    const requestParameters = request as unknown as Record<string, unknown>;
+    const value = Object.hasOwn(other, definition.id) ? other[definition.id] : requestParameters[definition.id] ?? definition.defaultValue;
+    if (value === undefined || value === null || value === "") {
+      if (definition.required) invalid(`模型参数“${definition.label}”为必填项`);
+      continue;
+    }
+    if (definition.type === "string" && typeof value !== "string" || definition.type === "number" && (typeof value !== "number" || !Number.isFinite(value)) || definition.type === "boolean" && typeof value !== "boolean") invalid(`模型参数“${definition.label}”的值类型不正确`);
+    if (typeof value === "string" && definition.required && !value.trim()) invalid(`模型参数“${definition.label}”不能为空`);
+    if (typeof value === "number") {
+      const stepOffset = value - (definition.min ?? 0);
+      if (definition.min !== undefined && value < definition.min || definition.max !== undefined && value > definition.max
+        || definition.step && Math.abs(stepOffset / definition.step - Math.round(stepOffset / definition.step)) > 1e-8) invalid(`模型参数“${definition.label}”超出允许范围`);
+    }
+    if (definition.options?.length && !definition.allowCustom && !definition.options.includes(value as string | number)) invalid(`模型参数“${definition.label}”不在允许选项中`);
+  }
+
+  const budget: ReferenceReadBudget = { usedBytes: 0, cache: new Map() };
   const references = async (items: MediaReference[] | undefined, type: string) => {
     if (!items?.length) return items ? [] : undefined;
     if (!directory) invalid("参考媒体需要工作目录");
     // ACT: 单次请求顺序处理引用，避免数十个参考媒体同时启动探测进程。
     const result: T[] = [];
-    for (const item of items) result.push(await read(directory, item, type, signal));
+    for (const item of items) result.push(await read(directory, item, type, signal, budget));
     return result;
   };
   const images = await references(request.images, "image");
@@ -155,30 +236,10 @@ async function prepareRequest<T>(directory: string | undefined, mediaType: "imag
   const audios = await references(request.audios, "audio");
   const firstFrame = (await references(request.firstFrame ? [request.firstFrame] : undefined, "image"))?.[0];
   const lastFrame = (await references(request.lastFrame ? [request.lastFrame] : undefined, "image"))?.[0];
-  const fallbackInputs: Record<string, T[] | undefined> = {
-    images, videos, audios,
-    firstFrame: firstFrame === undefined ? undefined : [firstFrame],
-    lastFrame: lastFrame === undefined ? undefined : [lastFrame],
-  };
-  const definitions = generation?.inputs ?? [];
-  const namedInputs = record(request.inputs);
-  if (Object.keys(namedInputs).some(key => !definitions.some(item => item.id === key))) invalid("请求包含当前模型未声明的素材输入角色");
   const inputs: Record<string, T[]> = {};
   for (const definition of definitions) {
-    const value = namedInputs[definition.id];
-    if (value !== undefined && !Array.isArray(value)) invalid(`素材输入“${definition.label}”必须是数组`);
-    const items = (value ?? []) as MediaReference[];
-    const fallback = fallbackInputs[definition.fallback ?? ""] ?? [];
-    const fallbackReferences = definition.fallbackIndex === undefined
-      ? fallback
-      : fallback[definition.fallbackIndex] === undefined ? [] : [fallback[definition.fallbackIndex]!];
-    const loaded = value === undefined
-      ? fallbackReferences
-      : await references(items, definition.mediaType) ?? [];
-    const itemCount = value === undefined ? loaded.length : items.length;
-    const minimum = definition.minItems ?? (definition.required ? 1 : 0);
-    if (itemCount < minimum) invalid(`素材输入“${definition.label}”至少需要 ${minimum} 个文件`);
-    if (definition.maxItems !== undefined && itemCount > definition.maxItems) invalid(`素材输入“${definition.label}”最多接受 ${definition.maxItems} 个文件`);
+    const items = plannedInputs.get(definition.id) ?? [];
+    const loaded = await references(items, definition.mediaType) ?? [];
     if (definition.accept?.length && loaded.some(item => {
       const mimeType = record(item).mimeType;
       return typeof mimeType !== "string" || !matchesMimeType(mimeType, definition.accept!);
@@ -186,27 +247,6 @@ async function prepareRequest<T>(directory: string | undefined, mediaType: "imag
     if (loaded.length) inputs[definition.id] = loaded;
   }
   const prompt = request.prompt ?? "";
-  const other = record(request.other);
-  if (generation?.parameters) {
-    const parameters = new Map(generation.parameters.map(item => [item.id, item]));
-    if (Object.keys(other).some(key => !parameters.has(key))) invalid("请求包含当前模型未声明的专属参数");
-    for (const definition of generation.parameters) {
-      const requestParameters = request as unknown as Record<string, unknown>;
-      const value = Object.hasOwn(other, definition.id) ? other[definition.id] : requestParameters[definition.id] ?? definition.defaultValue;
-      if (value === undefined || value === null || value === "") {
-        if (definition.required) invalid(`模型参数“${definition.label}”为必填项`);
-        continue;
-      }
-      if (definition.type === "string" && typeof value !== "string" || definition.type === "number" && (typeof value !== "number" || !Number.isFinite(value)) || definition.type === "boolean" && typeof value !== "boolean") invalid(`模型参数“${definition.label}”的值类型不正确`);
-      if (typeof value === "string" && definition.required && !value.trim()) invalid(`模型参数“${definition.label}”不能为空`);
-      if (typeof value === "number") {
-        const stepOffset = value - (definition.min ?? 0);
-        if (definition.min !== undefined && value < definition.min || definition.max !== undefined && value > definition.max
-          || definition.step && Math.abs(stepOffset / definition.step - Math.round(stepOffset / definition.step)) > 1e-8) invalid(`模型参数“${definition.label}”超出允许范围`);
-      }
-      if (definition.options?.length && !definition.allowCustom && !definition.options.includes(value as string | number)) invalid(`模型参数“${definition.label}”不在允许选项中`);
-    }
-  }
   if (mediaType === "audio") return {
     type: "audio" as const, model: request.modelId, prompt, text: prompt, images, audios,
     voice: request.voice, speed: request.speed, volume: request.volume, pitch: request.pitch, language: request.language, format: request.format, sampleRate: request.sampleRate,
