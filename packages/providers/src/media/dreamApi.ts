@@ -36,6 +36,8 @@ const acceptedMediaTypes: Record<DreamInput["mediaType"], string[]> = {
   video: ["video/mp4", "video/x-msvideo", "video/quicktime", "video/x-matroska", "video/webm"],
   audio: ["audio/mpeg", "audio/wav", "audio/x-wav", "audio/mp4", "audio/aac", "audio/flac"],
 };
+const videoTranslateSourceLanguages = ["zh", "en", "ja", "id", "es", "pt", "de", "fr", "ko", "fil", "ms", "th", "ar", "it", "bn", "el", "nl", "ru", "tr", "vi", "pl", "ro", "ne", "uk", "yue"];
+const videoTranslateTargetLanguages = ["zh", "en", "ja", "ko", "de", "fr", "it", "ru", "es", "pt", "pl", "nl", "hi", "id", "th", "vi", "ms", "ar", "el"];
 
 function input(id: string, label: string, mediaType: DreamInput["mediaType"], field: string, options: DreamInputOptions = {}): DreamInput {
   return { id, label, mediaType, field, accept: acceptedMediaTypes[mediaType], ...options };
@@ -269,8 +271,8 @@ const operations: DreamOperation[] = [
     inputs: [
       input("sourceVideo", "原始视频（节点连线第 1 个视频）", "video", "srcFileUrl", { required: true, minItems: 1, maxItems: 1, fallback: "videos", fallbackIndex: 0 }),
       input("alphaVideo", "Alpha 抠像视频（节点连线第 2 个视频）", "video", "mattingAlphaFileUrl", { required: true, minItems: 1, maxItems: 1, fallback: "videos", fallbackIndex: 1 }),
-      input("backgroundImage", "背景图片（背景类型为 image 时）", "image", "backgroundUrl", { maxItems: 1, fallback: "images", fallbackIndex: 0 }),
-      input("backgroundVideo", "背景视频（背景类型为 video 时）", "video", "backgroundUrl", { maxItems: 1, fallback: "videos", fallbackIndex: 2 }),
+      input("backgroundImage", "背景图片（背景类型为 image 时）", "image", "backgroundFileUrl", { maxItems: 1, fallback: "images", fallbackIndex: 0 }),
+      input("backgroundVideo", "背景视频（背景类型为 video 时）", "video", "backgroundFileUrl", { maxItems: 1, fallback: "videos", fallbackIndex: 2 }),
     ],
     parameters: [parameter("backgroundType", "背景类型", "string", { required: true, options: ["color", "image", "video"] }), parameter("backgroundColor", "背景颜色（十六进制）", "string")],
   },
@@ -282,8 +284,8 @@ const operations: DreamOperation[] = [
   { id: "videoTranslate20", label: "Video Translate 2.0", type: "video", endpoint: "/api/async/video_translate/2.0", mode: ["singleImage"], promptRequired: false, promptSupported: false,
     inputs: [input("sourceVideo", "待翻译视频", "video", "videoUrl", { required: true, minItems: 1, maxItems: 1, fallback: "videos", fallbackIndex: 0 })],
     parameters: [
-      parameter("sourceLanguage", "原语言", "string", { required: true, options: ["en", "zh", "es"] }),
-      parameter("targetLanguage", "目标语言", "string", { required: true, options: ["en", "zh", "es"] }),
+      parameter("sourceLanguage", "原语言", "string", { required: true, options: videoTranslateSourceLanguages }),
+      parameter("targetLanguage", "目标语言", "string", { required: true, options: videoTranslateTargetLanguages }),
       parameter("enableLipSync", "启用口型同步", "boolean", { defaultValue: true, includeDefault: true }),
     ] },
   { id: "ttsClone", label: "TTS Clone", type: "audio", endpoint: "/api/async/do_tts_clone", promptRequired: true, promptField: "text",
@@ -412,6 +414,7 @@ async function uploadInput(context: ProviderContext, source: MediaInput, apiKey:
     headers: { "Content-Type": `multipart/form-data; boundary=${multipart.boundary}` },
     body: multipart.body,
     signal,
+    redirect: "error",
   });
   if (!uploaded.ok) throw new Error(`DreamAPI 素材上传失败（HTTP ${uploaded.status}）`);
   let uploadPayload: Record<string, unknown>;
@@ -2800,22 +2803,14 @@ export default {
             "label": "原语言",
             "type": "string",
             "required": true,
-            "options": [
-              "en",
-              "zh",
-              "es"
-            ]
+            "options": videoTranslateSourceLanguages
           },
           {
             "id": "targetLanguage",
             "label": "目标语言",
             "type": "string",
             "required": true,
-            "options": [
-              "en",
-              "zh",
-              "es"
-            ]
+            "options": videoTranslateTargetLanguages
           },
           {
             "id": "enableLipSync",
