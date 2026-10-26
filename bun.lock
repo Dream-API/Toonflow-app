@@ -723,6 +723,16 @@
         "vue": "^3.5.42",
       },
     },
+    "packages/tools/dreamApi": {
+      "name": "@toonflow/tool-dreamapi",
+      "version": "1.0.0",
+      "dependencies": {
+        "zod": "^4.6.2",
+      },
+      "devDependencies": {
+        "@toonflow/tools-scaffold": "workspace:*",
+      },
+    },
     "packages/tools/ffmpeg": {
       "name": "@toonflow/tool-ffmpeg",
       "version": "2.0.0",
@@ -1426,6 +1436,8 @@
     "@toonflow/tool-browser": ["@toonflow/tool-browser@workspace:packages/tools/browser"],
 
     "@toonflow/tool-canvas": ["@toonflow/tool-canvas@workspace:packages/tools/canvas"],
+
+    "@toonflow/tool-dreamapi": ["@toonflow/tool-dreamapi@workspace:packages/tools/dreamApi"],
 
     "@toonflow/tool-ffmpeg": ["@toonflow/tool-ffmpeg@workspace:packages/tools/ffmpeg"],
 
