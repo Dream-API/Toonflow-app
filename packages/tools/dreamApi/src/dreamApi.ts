@@ -1,5 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import type { ToolContext, ToolDefinition } from "@toonflow/tools-scaffold/runtime";
 import type { DreamInputDefinition, DreamMediaType, DreamOperation, DreamParameterDefinition } from "./operations";
 
@@ -71,15 +73,48 @@ function errorCode(error: unknown) {
   return isRecord(error) && typeof error.code === "string" ? error.code : "";
 }
 
+function isPublicIpAddress(address: string) {
+  const family = isIP(address);
+  if (family === 4) {
+    const [a, b, c, d] = address.split(".").map(Number);
+    return !(a === 0 || a === 10 || a === 127 || a >= 224
+      || a === 100 && b! >= 64 && b! <= 127
+      || a === 169 && b === 254
+      || a === 172 && b! >= 16 && b! <= 31
+      || a === 192 && (b === 0 && (c === 0 || c === 2) || b === 88 && c === 99 || b === 168)
+      || a === 198 && (b === 18 || b === 19 || b === 51 && c === 100)
+      || a === 203 && b === 0 && c === 113
+      || a === 255 && b === 255 && c === 255 && d === 255);
+  }
+  if (family === 6) {
+    const groups = address.toLowerCase().split(":").filter(Boolean);
+    const first = Number.parseInt(groups[0] ?? "0", 16);
+    const second = Number.parseInt(groups[1] ?? "0", 16);
+    return (first & 0xe000) === 0x2000
+      && !(first === 0x2002 || first === 0x2001 && (second <= 0x01ff || second === 0x0db8));
+  }
+  return false;
+}
+
+async function assertPublicHttpsHost(url: URL, label: string) {
+  let addresses: Awaited<ReturnType<typeof lookup>>[];
+  try { addresses = await lookup(url.hostname, { all: true, verbatim: true }); }
+  catch { throw new Error(`${label} does not resolve to a public network address.`); }
+  if (!addresses.length || addresses.some(({ address }) => !isPublicIpAddress(address))) {
+    throw new Error(`${label} must resolve only to public network addresses.`);
+  }
+}
+
 function validateHttpsUrl(value: unknown, label: string) {
   if (typeof value !== "string" || value.length > 8192) throw new Error(`${label} is missing or invalid.`);
   let url: URL;
   try { url = new URL(value); }
   catch { throw new Error(`${label} is invalid.`); }
   const hostname = url.hostname.toLowerCase();
-  if (url.protocol !== "https:" || url.username || url.password || url.port && url.port !== "443"
+  if (url.protocol !== "https:" || url.username || url.password || url.port && url.port !== "443" || hostname.endsWith(".")
+    || !hostname.includes(".") || isIP(hostname) !== 0
     || hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local") || hostname.endsWith(".internal")
-    || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname) || hostname.startsWith("[")) {
+    || hostname.startsWith("[")) {
     throw new Error(`${label} must be a public HTTPS URL.`);
   }
   return url;
@@ -391,12 +426,15 @@ async function pollTask(taskId: string, apiKey: string, signal: AbortSignal, tim
     try {
       result = await postJson("/api/getAsyncResult", { taskId }, apiKey, signal);
     } catch (error) {
-      if (!isTransient(error)) throw error;
+      if (!isTransient(error)) {
+        const reason = error instanceof Error ? error.message : "unknown error";
+        throw new DreamApiTaskPendingError(taskId, "", `Task status could not be confirmed (${reason}); resume this same taskId and do not submit again.`);
+      }
       await wait(Math.min(1000, Math.max(1, deadline - Date.now())), signal);
       try { result = await postJson("/api/getAsyncResult", { taskId }, apiKey, signal); }
       catch (retryError) {
-        if (!isTransient(retryError)) throw retryError;
-        throw new DreamApiTaskPendingError(taskId, "", "A temporary polling error occurred; resume the same taskId instead of submitting again.");
+        const reason = retryError instanceof Error ? retryError.message : "unknown error";
+        throw new DreamApiTaskPendingError(taskId, "", `Task status could not be confirmed after retry (${reason}); resume this same taskId and do not submit again.`);
       }
     }
     const task = isRecord(result.task) ? result.task : {};
@@ -479,6 +517,7 @@ async function readBoundedResponse(response: Response, signal: AbortSignal) {
 
 async function downloadMedia(urlValue: string, expectedType: DreamMediaType, signal: AbortSignal) {
   const url = validateHttpsUrl(urlValue, "DreamAPI result URL");
+  await assertPublicHttpsHost(url, "DreamAPI result URL");
   let response: Response;
   try { response = await fetch(url, { redirect: "error", signal }); }
   catch (error) { signal.throwIfAborted(); throw new Error("Could not download the DreamAPI result.", { cause: error }); }
@@ -556,8 +595,19 @@ async function saveResults(context: ToolContext, request: DreamApiMediaRequest, 
           request.onUpdate, request.executionContext);
         assetLibraryPath = target;
       } catch (error) {
-        if (errorCode(error) === "EEXIST") assetLibraryPath = target;
-        else archiveFailed ||= error instanceof Error ? error.message : "Could not archive a result in the global asset library.";
+        if (errorCode(error) === "EEXIST") {
+          try {
+            const existing = await context.assets.execute(`${request.toolCallId}-asset-verify-${index}`,
+              { action: "read", path: target }, signal, request.onUpdate, request.executionContext);
+            const details = isRecord(existing.details) ? existing.details : {};
+            if (details.path !== target || details.size !== remote.bytes.byteLength || details.revision !== fileHash(remote.bytes)) {
+              throw new Error("An existing global asset conflicts with this DreamAPI task result; it was preserved.");
+            }
+            assetLibraryPath = target;
+          } catch (verifyError) {
+            archiveFailed ||= verifyError instanceof Error ? verifyError.message : "Could not verify the existing global asset.";
+          }
+        } else archiveFailed ||= error instanceof Error ? error.message : "Could not archive a result in the global asset library.";
       }
     }
     saved.push({ path, ...(assetLibraryPath ? { assetLibraryPath } : {}), mediaType: result.mediaType, mimeType: remote.mimeType, url: result.url });

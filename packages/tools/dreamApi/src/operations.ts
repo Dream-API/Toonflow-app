@@ -339,8 +339,9 @@ export function listDreamApiOperations(type?: DreamMediaType) {
     promptRequired: operation.promptRequired !== false,
     promptSupported: operation.promptSupported !== false,
     promptMaxLength: operation.promptMaxLength ?? 10000,
-    inputs: (operation.inputs ?? []).map(({ id, label, mediaType, required, minItems, maxItems, accept }) => ({
-      id, label, mediaType, required: required === true, minItems: minItems ?? (required ? 1 : 0), maxItems: maxItems ?? 1, accept,
+    inputs: (operation.inputs ?? []).map(({ id, label, mediaType, required, minItems, maxItems, array, accept }) => ({
+      id, label, mediaType, required: required === true, minItems: minItems ?? (required ? 1 : 0),
+      maxItems: maxItems ?? (array ? 20 : 1), ...(array ? { array: true } : {}), accept,
     })),
     parameters: (operation.parameters ?? []).map(({ id, label, type, required, options, min, max, step, defaultValue }) => ({
       id, label, type, required: required === true, ...(options ? { options } : {}), ...(min !== undefined ? { min } : {}),
